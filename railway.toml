@@ -1,0 +1,9 @@
+[service]
+name = "slack-duty-bot"
+
+[variables]
+TZ = "America/Los_Angeles"
+
+[deploy]
+# 9am Pacific time = 17:00 UTC (PST) / 16:00 UTC (PDT)
+cronSchedule = "0 17 * * 1-5"
