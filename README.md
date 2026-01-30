@@ -87,6 +87,3 @@ PEOPLE = [
 
 To find member IDs: Click on a user in Slack → View profile → Click "..." → Copy member ID.
 
-## Cost
-
-Railway's free tier includes $5/month credit which is more than enough for a cron job that runs once daily.
