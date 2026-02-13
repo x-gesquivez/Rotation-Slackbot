@@ -1,4 +1,4 @@
-# Slack Duty Assignment Bot (Railway)
+# Slack Duty Assignment Bot
 
 Automatically selects 2 people for **Service Desk** and assigns 2 **Operations** tasks each to the remaining members, every weekday morning.
 
