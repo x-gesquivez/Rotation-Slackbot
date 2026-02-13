@@ -1,13 +1,41 @@
-# Slack Duty Assignment Bot (Railway Hosted)
+# Slack Duty Assignment Bot (Railway)
 
-Automatically selects 2 people for **Service Desk** and assigns 2 **Operations** tasks each to the remaining members, every weekday at 9am Pacific time.
+Automatically selects 2 people for **Service Desk** and assigns 2 **Operations** tasks each to the remaining members, every weekday morning.
 
 ## Features
 
-- Random selection for Service Desk duty
-- Random assignment of operations tasks to remaining team members
+### Core Selection
+- **Random Service Desk selection**: Picks 2 team members for Service Desk duty
+- **Random operations assignment**: Assigns 2 operations tasks to remaining team members
 - **Consecutive selection protection**: No one can be selected for Service Desk more than 2 days in a row
-- 10-minute scheduling window to handle delayed cron execution
+
+### Fairness Guarantees
+- **Weekly minimum guarantee**: Ensures every team member gets at least one Service Desk assignment per week
+- **Weighted random selection**: People who haven't been on Service Desk this week get 3x higher selection weight
+- **Thursday/Friday urgency**: If someone still needs their weekly assignment and time is running out, they're prioritized
+
+### Scheduling & Exclusions
+- **Day-specific exclusions**: Remove specific people from rotation on specific days (e.g., Alex unavailable Mondays)
+- **Reduced operations days**: Configure days with 2+2 pattern (2 desk, 2 ops) instead of 2+all remaining
+- **Time guard**: Only executes if triggered between 9:00-9:09 AM Pacific
+
+### Onboarding Support
+- **Onboarding rotation**: Optional separate rotation for onboarding support with FTE/Contractor types
+- **Independent selection**: Onboarding assignments can overlap with Service Desk/Operations
+
+### Day-Based Operations Assignment
+Everyone in operations gets the same task types per day:
+
+| Day | Task 1 | Task 2 |
+|-----|--------|--------|
+| Monday | Onboarding Tickets | System Imaging |
+| Tuesday | System Imaging | 1 anyday task |
+| Wednesday | 1 anyday task | 1 anyday task |
+| Thursday | Onboarding Tickets | System Imaging |
+| Friday | Onboarding Tickets | 1 anyday task |
+
+- **Anyday tasks**: Assigned uniquely (1 person per task per day)
+- **Task repetition avoidance**: Tries to assign different anyday tasks than last run
 
 ## Setup
 
@@ -51,27 +79,79 @@ FORCE_RUN=1 python bot.py
 
 ## Environment Variables
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `SLACK_WEBHOOK_URL` | Slack incoming webhook URL | Yes |
-| `PEOPLE` | Comma-separated list of names | No (uses defaults) |
-| `OPERATIONS` | Comma-separated list of tasks | No (uses defaults) |
-| `FORCE_RUN` | Set to `1` to bypass schedule check | No |
-| `HISTORY_FILE` | Path to selection history JSON | No (defaults to `selection_history.json`) |
-| `MONDAY_EXCLUSIONS` | People unavailable on Mondays (comma-separated, case-insensitive) | No |
-| `TUESDAY_EXCLUSIONS` | People unavailable on Tuesdays | No |
-| `WEDNESDAY_EXCLUSIONS` | People unavailable on Wednesdays | No |
-| `THURSDAY_EXCLUSIONS` | People unavailable on Thursdays | No |
-| `FRIDAY_EXCLUSIONS` | People unavailable on Fridays | No |
-| `REDUCED_OPS_DAYS` | Days with 2+2 pattern instead of 2+3 (e.g., "Monday" or "Monday,Friday") | No |
-| `ONBOARDING_SCHEDULE` | Days and types for onboarding support (format: `Day:Type,Day:Type`). Default: `Monday:FTE,Tuesday:Contractor` | No |
-| `SIMULATE_DAY` | Simulate a specific day for testing (e.g., `Monday`, `Tuesday`) | No |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SLACK_WEBHOOK_URL` | Slack incoming webhook URL | **Required** |
+| `PEOPLE` | Comma-separated list of team member names | `Alex,Ed,Gibran,Mirage,Paul` |
+| `OPERATIONS` | Comma-separated list of operations tasks (supports Slack hyperlink format) | 9 Confluence-linked tasks |
+| `FORCE_RUN` | Set to `1`, `true`, or `yes` to bypass schedule check | Not set |
+| `HISTORY_FILE` | Path to selection history JSON file | `selection_history.json` |
+| `LOG_LEVEL` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
 
-## Notes
+### Day-Specific Exclusions
 
-- Runs at 9:00-9:09am Pacific time (PST/PDT) Monday-Friday
-- Railway's cron uses UTC; `railway.toml` runs at 16:00 and 17:00 UTC with a local-time guard in `bot.py`
-- Selection history is stored in `selection_history.json` to track consecutive selections
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MONDAY_EXCLUSIONS` | People unavailable on Mondays (comma-separated, case-insensitive) | `Alex` |
+| `TUESDAY_EXCLUSIONS` | People unavailable on Tuesdays | None |
+| `WEDNESDAY_EXCLUSIONS` | People unavailable on Wednesdays | None |
+| `THURSDAY_EXCLUSIONS` | People unavailable on Thursdays | None |
+| `FRIDAY_EXCLUSIONS` | People unavailable on Fridays | None |
+
+### Scheduling Options
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `REDUCED_OPS_DAYS` | Days with 2+2 pattern instead of 2+remaining (e.g., `Monday` or `Monday,Friday`) | `Monday` |
+| `ONBOARDING_SCHEDULE` | Days and types for onboarding support. Format: `Day:Type,Day:Type` | `Monday:FTE,Tuesday:Contractor` |
+| `SIMULATE_DAY` | Simulate a specific day for testing (e.g., `Monday`, `Tuesday`). Useful for testing exclusions and scheduling. | Not set |
+
+## How It Works
+
+### Selection Algorithm
+
+**Service Desk Selection:**
+1. **Exclude unavailable people**: Anyone excluded for today's day (e.g., `MONDAY_EXCLUSIONS`) is removed from the rotation entirely
+2. **Apply consecutive protection**: Anyone selected for Service Desk 2 days in a row becomes ineligible (soft exclusion—can be overridden if short-staffed)
+3. **Calculate weekly priority**:
+   - People with 0 Service Desk assignments this week get 3x selection weight
+   - On Thursday/Friday, if someone still needs their minimum and slots are running out, they're guaranteed a spot
+4. **Select 2 for Service Desk**: Using weighted random selection
+
+**Operations Assignment (Day-Based):**
+Everyone gets the same task types based on the day:
+- **Mon/Thu**: Onboarding Tickets + System Imaging
+- **Tue**: System Imaging + 1 anyday task (unique)
+- **Wed**: 2 anyday tasks (unique)
+- **Fri**: Onboarding Tickets + 1 anyday task (unique)
+
+### History Tracking
+
+The bot maintains state in `selection_history.json`:
+
+```json
+{
+  "last_selections": [["Ed", "Alex"], ["Paul", "Alex"]],
+  "last_ops": {
+    "Ed": ["stockroom & cage clean up", "e-waste checks laptops"],
+    "Gibran": ["system imaging fte/contract", "stockroom & cage clean up"]
+  },
+  "weekly_servicedesk": {
+    "week": "2026-W07",
+    "assignments": {"Mirage": 1, "Paul": 3, "Gibran": 2, "Ed": 2, "Alex": 2}
+  }
+}
+```
+
+- `last_selections`: Last 2 days of Service Desk picks (for consecutive protection)
+- `last_ops`: Last run's operations per person (for anyday task variety)
+- `weekly_servicedesk`: Service Desk assignments per week (resets on new ISO week)
+
+## Deployment Notes
+
+- **Scheduling**: Runs at 9:00am Pacific time Monday-Friday, year-round
+- **How it works**: Railway cron fires at both 16:00 and 17:00 UTC on weekdays. The code only executes if triggered between 9:00-9:09am Pacific, so the "wrong" trigger is ignored automatically
+- Selection history persists across runs in `selection_history.json`
 
 ## To Use Slack @mentions
 
@@ -87,3 +167,67 @@ PEOPLE = [
 
 To find member IDs: Click on a user in Slack → View profile → Click "..." → Copy member ID.
 
+## Example Output
+
+**Thursday (Onboarding + Imaging):**
+```
+🖥️ *Service Desk*
+    Ed
+    Gibran
+
+⚙️ *Operations*
+    Alex
+        • Onboarding Tickets
+        • System Imaging FTE/Contract
+    Mirage
+        • Onboarding Tickets
+        • System Imaging FTE/Contract
+    Paul
+        • Onboarding Tickets
+        • System Imaging FTE/Contract
+```
+
+**Tuesday (Imaging + anyday):**
+```
+🖥️ *Service Desk*
+    Ed
+    Paul
+
+⚙️ *Operations*
+    Alex
+        • System Imaging FTE/Contract
+        • E-waste Checks Laptops
+    Gibran
+        • System Imaging FTE/Contract
+        • Audit Idle Hardware
+    Mirage
+        • System Imaging FTE/Contract
+        • Stockroom & Cage Clean up
+
+👋 *Onboarding Support (Contractor):*
+    Gibran
+    Alex
+ℹ️ _Class ≤8: 1 support needed | Class 9+: 2 support needed_
+```
+
+**Wednesday (anyday + anyday):**
+```
+🖥️ *Service Desk*
+    Paul
+    Mirage
+
+⚙️ *Operations*
+    Alex
+        • Offboard Hold Checks
+        • RMA Checks Laptops
+    Ed
+        • Audit Idle Hardware
+        • RMA Checks Monitors
+    Gibran
+        • Stockroom & Cage Clean up
+        • E-waste Checks Laptops
+```
+
+## Cost
+
+Railway's Hobby plan is sufficient for this use case. The cron fires twice per weekday but only one execution runs, using minimal resources.
