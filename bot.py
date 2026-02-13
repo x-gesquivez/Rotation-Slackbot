@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 # Configuration
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "WEBOOK HERE")
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 HISTORY_FILE = Path(os.environ.get("HISTORY_FILE", "selection_history.json"))
 
@@ -46,6 +46,16 @@ DEFAULT_DAY_EXCLUSIONS = {
 DEFAULT_REDUCED_OPS_DAYS = "Monday"
 DEFAULT_ONBOARDING_SCHEDULE = "Monday:FTE,Tuesday:Contractor"
 
+# Day-based operations assignment rules
+# Each day defines what task types everyone in operations gets
+DAY_OPS_RULES = {
+    "monday": ["onboarding", "imaging"],      # Onboarding Tickets + System Imaging
+    "tuesday": ["imaging", "anyday"],         # System Imaging + 1 anyday task
+    "wednesday": ["anyday", "anyday"],        # 2 anyday tasks only
+    "thursday": ["onboarding", "imaging"],    # Onboarding Tickets + System Imaging
+    "friday": ["onboarding", "anyday"],       # Onboarding Tickets + 1 anyday task
+}
+
 
 def parse_env_list(value):
     if not value:
@@ -71,6 +81,52 @@ def extract_task_name(task):
     return task.strip()
 
 
+def find_task_by_name(operations, name_fragment):
+    """Find task containing name fragment (case-insensitive)."""
+    name_lower = name_fragment.casefold()
+    for task in operations:
+        if name_lower in extract_task_name(task).casefold():
+            return task
+    return None
+
+
+def get_anyday_tasks(operations):
+    """Return tasks that are not onboarding or system imaging."""
+    excluded_names = {"onboarding", "system imaging"}
+    available = []
+    for task in operations:
+        task_name = extract_task_name(task).casefold()
+        if not any(excl in task_name for excl in excluded_names):
+            available.append(task)
+    return available
+
+
+def pick_anyday_task(pool, used_tasks, yesterday_tasks):
+    """Pick an unused anyday task, preferring ones not done yesterday.
+
+    Args:
+        pool: list of available anyday tasks
+        used_tasks: set of task names (casefolded) already assigned today
+        yesterday_tasks: list of task names (casefolded) this person did yesterday
+
+    Returns: task string or None if no tasks available
+    """
+    yesterday_set = set(yesterday_tasks)
+
+    # Filter out already-used tasks
+    available = [t for t in pool if extract_task_name(t).casefold() not in used_tasks]
+    if not available:
+        return None
+
+    # Prefer tasks not done yesterday
+    fresh = [t for t in available if extract_task_name(t).casefold() not in yesterday_set]
+    if fresh:
+        return random.choice(fresh)
+
+    # Fall back to any available task
+    return random.choice(available)
+
+
 def get_day_name(now=None):
     """Return the day name, or SIMULATE_DAY if set (for testing)."""
     simulated = os.environ.get("SIMULATE_DAY", "").strip()
@@ -82,22 +138,52 @@ def get_day_name(now=None):
     return now.strftime("%A")
 
 
+def get_week_key(now=None):
+    """Return ISO week identifier (YYYY-WNN format) for week reset detection."""
+    if now is None:
+        now = datetime.now(LOCAL_TZ)
+    return now.strftime("%G-W%V")
+
+
+def get_remaining_workdays(now=None):
+    """Return remaining workdays in week including today (Mon=5, Fri=1, Weekend=0)."""
+    simulated = os.environ.get("SIMULATE_DAY", "").strip()
+    if simulated:
+        day_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4}
+        weekday = day_map.get(simulated.casefold(), 0)
+    else:
+        if now is None:
+            now = datetime.now(LOCAL_TZ)
+        weekday = now.weekday()
+    if weekday > 4:
+        return 0
+    return 5 - weekday
+
+
 def load_history():
-    """Load selection history from file."""
+    """Load selection history from file, including weekly ServiceDesk tracking."""
+    current_week = get_week_key()
+    default_weekly = {"week": current_week, "assignments": {}}
+
     if not HISTORY_FILE.exists():
-        return [], {}
+        return [], {}, default_weekly
     try:
         data = json.loads(HISTORY_FILE.read_text())
         selections = data.get("last_selections", [])[-2:]
         last_ops = data.get("last_ops", {})
         if not isinstance(last_ops, dict):
             last_ops = {}
-        return selections, last_ops
+
+        weekly = data.get("weekly_servicedesk", {})
+        if weekly.get("week") != current_week:
+            weekly = default_weekly
+
+        return selections, last_ops, weekly
     except (json.JSONDecodeError, OSError):
-        return [], {}
+        return [], {}, default_weekly
 
 
-def save_history(selected, history, assignments=None, prev_ops=None):
+def save_history(selected, history, assignments=None, prev_ops=None, weekly=None):
     """Save updated selection history, keeping only last 2."""
     new_history = (history + [selected])[-2:]
     if assignments:
@@ -106,9 +192,17 @@ def save_history(selected, history, assignments=None, prev_ops=None):
             ops[person] = [extract_task_name(t).casefold() for t in tasks]
     else:
         ops = prev_ops or {}
+
+    if weekly is None:
+        weekly = {"week": get_week_key(), "assignments": {}}
+
+    for person in selected:
+        weekly["assignments"][person] = weekly["assignments"].get(person, 0) + 1
+
     HISTORY_FILE.write_text(json.dumps({
         "last_selections": new_history,
         "last_ops": ops,
+        "weekly_servicedesk": weekly,
     }))
 
 
@@ -133,6 +227,28 @@ def get_day_exclusions(now=None):
     excluded_names = parse_env_list(os.environ.get(env_var, default))
     # Return both original (for logging) and normalized (for matching)
     return set(excluded_names), {name.casefold() for name in excluded_names}
+
+
+def get_people_needing_weekly_assignment(weekly, people):
+    """Return set of people (lowercased) with 0 ServiceDesk assignments this week."""
+    assignments = weekly.get("assignments", {})
+    return {p.casefold() for p in people if assignments.get(p, 0) == 0}
+
+
+def calculate_weekly_priority(eligible_keys, people_needing, remaining_days):
+    """Determine selection strategy based on urgency.
+
+    Returns: (must_prioritize: bool, priority_pool: list)
+    - must_prioritize: True if we MUST select from people_needing (Thu/Fri urgency)
+    - priority_pool: eligible people who need their weekly assignment
+    """
+    eligible_needing = [k for k in eligible_keys if k in people_needing]
+
+    max_remaining_slots = remaining_days * 2
+    if people_needing and len(people_needing) >= max_remaining_slots:
+        return True, eligible_needing
+
+    return False, eligible_needing
 
 
 def get_onboarding_config(now=None):
@@ -178,49 +294,82 @@ def should_run_now(now=None):
     return now.weekday() < 5 and now.hour == 9 and now.minute < 10
 
 
-def assign_operations(remaining, operations, last_ops=None):
-    if not remaining:
+def assign_operations_by_day(ops_people, operations, day_name, last_ops):
+    """Assign operations tasks based on day rules.
+
+    Everyone gets the same task types per day:
+    - Mon: Onboarding + Imaging
+    - Tue: Imaging + anyday
+    - Wed: anyday + anyday
+    - Thu: Onboarding + Imaging
+    - Fri: Onboarding + anyday
+
+    Args:
+        ops_people: list of people assigned to operations today
+        operations: list of all operation tasks
+        day_name: current day name (e.g., "monday")
+        last_ops: dict of {person: [task_names]} from last run
+
+    Returns: assignments dict {person: [task1, task2]}
+    """
+    if not ops_people:
         return {}
     if not operations:
         raise ValueError("No operations configured")
 
-    if len(operations) == 1:
-        return {person: [operations[0], operations[0]] for person in remaining}
-
+    day_lower = day_name.casefold()
+    rules = DAY_OPS_RULES.get(day_lower, ["anyday", "anyday"])
     last_ops = last_ops if isinstance(last_ops, dict) else {}
-    assignments = {}
 
-    for person in remaining:
-        # last_ops values are already normalized (casefolded) from save_history
-        prev_tasks = set(last_ops.get(person, []))
-        fresh = [op for op in operations if extract_task_name(op).casefold() not in prev_tasks]
+    assignments = {p: [] for p in ops_people}
+    used_anyday = set()
 
-        if len(fresh) >= 2:
-            picked = random.sample(fresh, 2)
-        elif len(fresh) == 1:
-            # Guarantee the 1 fresh task, pick second from full list
-            second = random.choice([op for op in operations if op != fresh[0]])
-            picked = [fresh[0], second]
-            random.shuffle(picked)
-        else:
-            # All tasks were done yesterday — fall back to full list
-            picked = random.sample(operations, 2)
+    onboarding = find_task_by_name(operations, "onboarding")
+    imaging = find_task_by_name(operations, "system imaging")
+    anyday_pool = get_anyday_tasks(operations)
 
-        assignments[person] = picked
+    logger.info("Day rules for %s: %s", day_name, rules)
+
+    for person in ops_people:
+        for slot_type in rules:
+            if slot_type == "onboarding":
+                if onboarding:
+                    assignments[person].append(onboarding)
+                else:
+                    logger.warning("Onboarding task not found in operations list")
+            elif slot_type == "imaging":
+                if imaging:
+                    assignments[person].append(imaging)
+                else:
+                    logger.warning("System Imaging task not found in operations list")
+            else:  # anyday
+                task = pick_anyday_task(anyday_pool, used_anyday, last_ops.get(person, []))
+                if task:
+                    assignments[person].append(task)
+                    used_anyday.add(extract_task_name(task).casefold())
+                else:
+                    logger.warning("No more anyday tasks available for %s", person)
 
     return assignments
 
 
-def run_selection(people, operations, history_excluded=None, day_excluded_lower=None, reduced_ops=False, last_ops=None):
+def run_selection(people, operations, history_excluded=None, day_excluded_lower=None,
+                  reduced_ops=False, last_ops=None, weekly=None, remaining_days=5,
+                  day_name=None):
     """Select 2 people for HelpDesk and assign operations to the rest.
 
     - history_excluded: soft exclusion (can be re-included for HelpDesk if short-staffed)
     - day_excluded_lower: hard exclusion set (lowercased, completely removed from rotation)
     - reduced_ops: if True, only assign 2 people to Operations (not all remaining)
-    - last_ops: yesterday's operations assignments per person (for avoiding repeats)
+    - last_ops: last run's operations assignments per person (for avoiding repeats)
+    - weekly: weekly ServiceDesk tracking for minimum guarantee
+    - remaining_days: workdays left in week for urgency calculation
+    - day_name: current day name for day-based task assignment
     """
     history_excluded = history_excluded or set()
     day_excluded_lower = day_excluded_lower or set()
+    weekly = weekly or {"week": get_week_key(), "assignments": {}}
+    day_name = day_name or get_day_name()
 
     # Normalize once: map lowercased name -> original name
     name_lookup = {p.casefold(): p for p in people}
@@ -229,6 +378,10 @@ def run_selection(people, operations, history_excluded=None, day_excluded_lower=
     # Remove day-excluded people entirely from today's rotation
     available_keys = [k for k in name_lookup if k not in day_excluded_lower]
 
+    # Get people who still need their weekly ServiceDesk assignment
+    people_needing = get_people_needing_weekly_assignment(weekly, people)
+    people_needing_available = people_needing - day_excluded_lower
+
     # Apply history exclusions (soft - can be overridden if short-staffed)
     eligible_keys = [k for k in available_keys if k not in history_excluded_lower]
 
@@ -236,10 +389,46 @@ def run_selection(people, operations, history_excluded=None, day_excluded_lower=
     if len(eligible_keys) < 2:
         eligible_keys = available_keys[:]
 
-    # Select up to 2 for HelpDesk
+    # Calculate weekly priority
+    must_prioritize, priority_pool = calculate_weekly_priority(
+        eligible_keys, people_needing_available, remaining_days
+    )
+
     num_helpdesk = min(2, len(eligible_keys))
-    shuffled_keys = random.sample(eligible_keys, len(eligible_keys))
-    selected_keys = shuffled_keys[:num_helpdesk]
+
+    if must_prioritize and priority_pool:
+        # MUST select from those who need weekly assignment (Thu/Fri urgency)
+        num_from_priority = min(num_helpdesk, len(priority_pool))
+        selected_keys = random.sample(priority_pool, num_from_priority)
+
+        if num_from_priority < num_helpdesk:
+            others = [k for k in eligible_keys if k not in selected_keys]
+            if others:
+                selected_keys.append(random.choice(others))
+
+        logger.info(
+            "Weekly minimum enforcement: prioritizing %s",
+            [name_lookup[k] for k in selected_keys if k in priority_pool]
+        )
+    elif people_needing_available:
+        # PREFER those needing assignment (weighted random, 3x weight)
+        weighted_pool = []
+        for k in eligible_keys:
+            weight = 3 if k in people_needing_available else 1
+            weighted_pool.extend([k] * weight)
+        random.shuffle(weighted_pool)
+
+        selected_keys = []
+        for k in weighted_pool:
+            if k not in selected_keys:
+                selected_keys.append(k)
+                if len(selected_keys) == num_helpdesk:
+                    break
+    else:
+        # All have met weekly minimum - standard random selection
+        shuffled_keys = random.sample(eligible_keys, len(eligible_keys))
+        selected_keys = shuffled_keys[:num_helpdesk]
+
     selected = [name_lookup[k] for k in selected_keys]
 
     # Remaining people for Operations
@@ -250,7 +439,7 @@ def run_selection(people, operations, history_excluded=None, day_excluded_lower=
         remaining_keys = random.sample(remaining_keys, 2)
 
     remaining = [name_lookup[k] for k in remaining_keys]
-    assignments = assign_operations(remaining, operations, last_ops)
+    assignments = assign_operations_by_day(remaining, operations, day_name, last_ops)
     return selected, assignments
 
 
@@ -313,7 +502,9 @@ def main():
         return
 
     # Load history and get exclusions
-    history, last_ops = load_history()
+    history, last_ops, weekly = load_history()
+    logger.info("Weekly ServiceDesk counts: %s", weekly.get("assignments", {}))
+
     history_excluded = get_excluded_people(history)
     if history_excluded:
         logger.info("Excluding from HelpDesk (selected 2x in a row): %s", history_excluded)
@@ -324,6 +515,10 @@ def main():
     if day_excluded:
         logger.info("Excluding from rotation (unavailable today): %s", day_excluded)
 
+    # Calculate remaining workdays for weekly minimum enforcement
+    remaining_days = get_remaining_workdays(now)
+    logger.info("Remaining workdays this week: %d", remaining_days)
+
     # Check if today is a reduced operations day (2+2 instead of 2+3)
     reduced_ops_days = parse_env_list(os.environ.get("REDUCED_OPS_DAYS", DEFAULT_REDUCED_OPS_DAYS))
     reduced_ops_days_lower = {d.casefold() for d in reduced_ops_days}
@@ -332,7 +527,9 @@ def main():
 
     try:
         selected, assignments = run_selection(
-            people, operations, history_excluded, day_excluded_lower, is_reduced_ops_day, last_ops
+            people, operations, history_excluded, day_excluded_lower,
+            is_reduced_ops_day, last_ops, weekly, remaining_days,
+            today_name
         )
     except ValueError as exc:
         logger.error("Configuration error: %s", exc)
@@ -350,7 +547,7 @@ def main():
 
     # Save selection history (best-effort, don't crash if filesystem is read-only)
     try:
-        save_history(selected, history, assignments, prev_ops=last_ops)
+        save_history(selected, history, assignments, prev_ops=last_ops, weekly=weekly)
     except OSError:
         logger.warning("Could not save selection history (read-only filesystem?)")
 
