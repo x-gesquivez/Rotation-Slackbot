@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -161,12 +161,17 @@ def get_remaining_workdays(now=None):
 
 
 def load_history():
-    """Load selection history from file, including weekly ServiceDesk tracking."""
+    """Load selection history from file, including weekly ServiceDesk tracking.
+
+    Returns: (selections, last_ops, weekly, preview, last_onboarding)
+        preview is the next_day_selection dict or None.
+        last_onboarding is the list of people from the last onboarding run.
+    """
     current_week = get_week_key()
     default_weekly = {"week": current_week, "assignments": {}}
 
     if not HISTORY_FILE.exists():
-        return [], {}, default_weekly
+        return [], {}, default_weekly, None, []
     try:
         data = json.loads(HISTORY_FILE.read_text())
         selections = data.get("last_selections", [])[-2:]
@@ -178,12 +183,15 @@ def load_history():
         if weekly.get("week") != current_week:
             weekly = default_weekly
 
-        return selections, last_ops, weekly
+        preview = data.get("next_day_selection")
+        last_onboarding = data.get("last_onboarding", [])
+        return selections, last_ops, weekly, preview, last_onboarding
     except (json.JSONDecodeError, OSError):
-        return [], {}, default_weekly
+        return [], {}, default_weekly, None, []
 
 
-def save_history(selected, history, assignments=None, prev_ops=None, weekly=None):
+def save_history(selected, history, assignments=None, prev_ops=None, weekly=None,
+                 onboarding_people=None):
     """Save updated selection history, keeping only last 2."""
     new_history = (history + [selected])[-2:]
     if assignments:
@@ -199,11 +207,23 @@ def save_history(selected, history, assignments=None, prev_ops=None, weekly=None
     for person in selected:
         weekly["assignments"][person] = weekly["assignments"].get(person, 0) + 1
 
-    HISTORY_FILE.write_text(json.dumps({
+    data = {
         "last_selections": new_history,
         "last_ops": ops,
         "weekly_servicedesk": weekly,
-    }))
+        "last_onboarding": onboarding_people or [],
+    }
+    HISTORY_FILE.write_text(json.dumps(data))
+
+
+def save_preview(preview_data):
+    """Save next-day selection preview to history file without touching other fields."""
+    try:
+        data = json.loads(HISTORY_FILE.read_text()) if HISTORY_FILE.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    data["next_day_selection"] = preview_data
+    HISTORY_FILE.write_text(json.dumps(data))
 
 
 def get_excluded_people(history):
@@ -269,13 +289,15 @@ def get_onboarding_config(now=None):
     return None
 
 
-def select_onboarding(people, day_excluded_lower=None):
+def select_onboarding(people, day_excluded_lower=None, last_onboarding=None):
     """Select 2 people for onboarding support.
 
     Independent selection - can overlap with HelpDesk/Operations.
-    Day exclusions still apply.
+    Day exclusions still apply. People from the last onboarding run are
+    soft-excluded (re-included if the pool would be too small).
     """
     day_excluded_lower = day_excluded_lower or set()
+    last_onboarding_lower = {p.casefold() for p in (last_onboarding or [])}
 
     # Filter out day-excluded people
     available = [p for p in people if p.casefold() not in day_excluded_lower]
@@ -283,7 +305,12 @@ def select_onboarding(people, day_excluded_lower=None):
     if len(available) == 0:
         return []
 
-    return random.sample(available, min(2, len(available)))
+    # Soft-exclude people from last onboarding run
+    eligible = [p for p in available if p.casefold() not in last_onboarding_lower]
+    if len(eligible) < 2:
+        eligible = available  # fallback: re-include if pool too small
+
+    return random.sample(eligible, min(2, len(eligible)))
 
 
 def should_run_now(now=None):
@@ -292,6 +319,29 @@ def should_run_now(now=None):
     if now is None:
         now = datetime.now(LOCAL_TZ)
     return now.weekday() < 5 and now.hour == 9 and now.minute < 10
+
+
+def get_next_workday(now=None):
+    """Return the next workday as a datetime (skips weekends).
+
+    Mon→Tue, Tue→Wed, ..., Thu→Fri, Fri→Mon, Sat→Mon, Sun→Mon.
+    """
+    if now is None:
+        now = datetime.now(LOCAL_TZ)
+    next_day = now + timedelta(days=1)
+    # Skip Saturday (5) and Sunday (6)
+    while next_day.weekday() > 4:
+        next_day += timedelta(days=1)
+    return next_day
+
+
+def should_run_preview(now=None):
+    """Return True if we should run the next-day preview (5:30 PM Pacific, Mon-Fri)."""
+    if env_truthy("FORCE_PREVIEW"):
+        return True
+    if now is None:
+        now = datetime.now(LOCAL_TZ)
+    return now.weekday() < 5 and now.hour == 17 and 25 <= now.minute < 40
 
 
 def assign_operations_by_day(ops_people, operations, day_name, last_ops):
@@ -470,6 +520,36 @@ def format_message(selected, assignments, onboarding_people=None, onboarding_typ
     return "\n".join(lines)
 
 
+def format_preview_message(selected, assignments, onboarding_people=None,
+                           onboarding_type=None, target_day_name="Tomorrow"):
+    """Format preview message for next-day assignments."""
+    lines = [f"📋 *Tomorrow's Assignments ({target_day_name})*", ""]
+    lines.append("🖥️ *Service Desk*")
+    if selected:
+        lines.extend([f"    {person}" for person in selected])
+    else:
+        lines.append("    (none)")
+    lines.append("")
+    lines.append("⚙️ *Operations*")
+
+    if assignments:
+        for person, ops in assignments.items():
+            lines.append(f"    {person}")
+            for task in ops:
+                lines.append(f"        • {task}")
+    else:
+        lines.append("    (none)")
+
+    if onboarding_people:
+        lines.append("")
+        lines.append(f"👋 *Onboarding Support ({onboarding_type}):*")
+        for person in onboarding_people:
+            lines.append(f"    {person}")
+        lines.append("ℹ️ _Class ≤8: 1 support needed | Class 9+: 2 support needed_")
+
+    return "\n".join(lines)
+
+
 def send_to_slack(message):
     if not SLACK_WEBHOOK_URL:
         logger.warning("No SLACK_WEBHOOK_URL set. Message would be:\n%s", message)
@@ -487,7 +567,92 @@ def send_to_slack(message):
         logger.exception("Failed to send message to Slack")
 
 
+def run_preview():
+    """Run next-day selection at 5:30 PM and post preview to Slack."""
+    now = datetime.now(LOCAL_TZ)
+    next_wd = get_next_workday(now)
+    target_date = next_wd.strftime("%Y-%m-%d")
+    target_day_name = next_wd.strftime("%A")
+    day_name = target_day_name.casefold()
+
+    logger.info("Running preview for %s (%s)", target_day_name, target_date)
+
+    people = get_config_list("PEOPLE", PEOPLE)
+    operations = get_config_list("OPERATIONS", OPERATIONS)
+
+    if not people:
+        logger.error("No PEOPLE configured; skipping preview.")
+        return
+
+    # Load current history (today's state)
+    history, last_ops, weekly, _, last_onboarding = load_history()
+
+    # Get exclusions for the TARGET day (tomorrow)
+    day_excluded, day_excluded_lower = get_day_exclusions(next_wd)
+
+    # Handle week boundary (e.g., Friday preview for Monday)
+    target_week = get_week_key(next_wd)
+    if weekly.get("week") != target_week:
+        logger.info("Week boundary: resetting weekly counts for %s", target_week)
+        weekly = {"week": target_week, "assignments": {}}
+
+    history_excluded = get_excluded_people(history)
+    if history_excluded:
+        logger.info("Preview excluding from HelpDesk (selected 2x in a row): %s", history_excluded)
+    if day_excluded:
+        logger.info("Preview excluding from rotation (%s unavailable): %s", target_day_name, day_excluded)
+
+    remaining_days = get_remaining_workdays(next_wd)
+    logger.info("Preview remaining workdays in target week: %d", remaining_days)
+
+    # Check reduced ops for target day
+    reduced_ops_days = parse_env_list(os.environ.get("REDUCED_OPS_DAYS", DEFAULT_REDUCED_OPS_DAYS))
+    reduced_ops_days_lower = {d.casefold() for d in reduced_ops_days}
+    is_reduced_ops_day = day_name in reduced_ops_days_lower
+
+    try:
+        selected, assignments = run_selection(
+            people, operations, history_excluded, day_excluded_lower,
+            is_reduced_ops_day, last_ops, weekly, remaining_days, day_name
+        )
+    except ValueError as exc:
+        logger.error("Configuration error during preview: %s", exc)
+        return
+
+    # Check onboarding for target day
+    onboarding_type = get_onboarding_config(next_wd)
+    onboarding_people = []
+    if onboarding_type:
+        onboarding_people = select_onboarding(people, day_excluded_lower, last_onboarding)
+        logger.info("Preview onboarding (%s): %s", onboarding_type, onboarding_people)
+
+    logger.info("Preview selected for Service Desk: %s", selected)
+
+    # Save preview (preserves existing history fields)
+    preview_data = {
+        "target_date": target_date,
+        "selected": selected,
+        "assignments": {p: list(tasks) for p, tasks in assignments.items()},
+        "onboarding_people": onboarding_people,
+        "onboarding_type": onboarding_type,
+    }
+    try:
+        save_preview(preview_data)
+    except OSError:
+        logger.warning("Could not save preview (read-only filesystem?)")
+
+    message = format_preview_message(
+        selected, assignments, onboarding_people, onboarding_type, target_day_name
+    )
+    send_to_slack(message)
+
+
 def main():
+    # Check for preview run first (5:30 PM)
+    if should_run_preview():
+        run_preview()
+        return
+
     if not should_run_now():
         logger.info(
             "Skipping run; not scheduled local time. Set FORCE_RUN=1 to override."
@@ -502,15 +667,48 @@ def main():
         return
 
     # Load history and get exclusions
-    history, last_ops, weekly = load_history()
+    history, last_ops, weekly, preview, last_onboarding = load_history()
     logger.info("Weekly ServiceDesk counts: %s", weekly.get("assignments", {}))
 
+    # Check for locked-in preview from last night's 5:30 PM run
+    now = datetime.now(LOCAL_TZ)
+    today_str = now.strftime("%Y-%m-%d")
+    use_preview = (
+        preview
+        and preview.get("target_date") == today_str
+        and not env_truthy("FORCE_RESELECT")
+    )
+
+    if use_preview:
+        logger.info("Using locked-in preview for %s", today_str)
+        selected = preview["selected"]
+        assignments = preview["assignments"]
+        onboarding_people = preview.get("onboarding_people", [])
+        onboarding_type = preview.get("onboarding_type")
+
+        message = format_message(selected, assignments, onboarding_people, onboarding_type)
+        send_to_slack(message)
+
+        # Save history to update last_selections and weekly counts (also clears preview)
+        try:
+            save_history(selected, history, assignments, prev_ops=last_ops, weekly=weekly,
+                         onboarding_people=onboarding_people if onboarding_people else last_onboarding)
+        except OSError:
+            logger.warning("Could not save selection history (read-only filesystem?)")
+        return
+
+    if preview and preview.get("target_date") != today_str:
+        logger.info("Stale preview found (target: %s, today: %s); running fresh selection",
+                     preview.get("target_date"), today_str)
+    elif env_truthy("FORCE_RESELECT"):
+        logger.info("FORCE_RESELECT set; ignoring preview and re-randomizing")
+
+    # Normal selection flow (no preview or stale/overridden preview)
     history_excluded = get_excluded_people(history)
     if history_excluded:
         logger.info("Excluding from HelpDesk (selected 2x in a row): %s", history_excluded)
 
     # Get day-specific exclusions (completely removed from rotation)
-    now = datetime.now(LOCAL_TZ)
     day_excluded, day_excluded_lower = get_day_exclusions(now)
     if day_excluded:
         logger.info("Excluding from rotation (unavailable today): %s", day_excluded)
@@ -539,7 +737,7 @@ def main():
     onboarding_type = get_onboarding_config(now)
     onboarding_people = []
     if onboarding_type:
-        onboarding_people = select_onboarding(people, day_excluded_lower)
+        onboarding_people = select_onboarding(people, day_excluded_lower, last_onboarding)
         logger.info("Onboarding (%s): %s", onboarding_type, onboarding_people)
 
     message = format_message(selected, assignments, onboarding_people, onboarding_type)
@@ -547,7 +745,8 @@ def main():
 
     # Save selection history (best-effort, don't crash if filesystem is read-only)
     try:
-        save_history(selected, history, assignments, prev_ops=last_ops, weekly=weekly)
+        save_history(selected, history, assignments, prev_ops=last_ops, weekly=weekly,
+                     onboarding_people=onboarding_people if onboarding_people else last_onboarding)
     except OSError:
         logger.warning("Could not save selection history (read-only filesystem?)")
 
