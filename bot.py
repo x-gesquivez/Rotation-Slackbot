@@ -13,6 +13,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 HISTORY_FILE = Path(os.environ.get("HISTORY_FILE", "selection_history.json"))
 UNAVAILABLE_FILE = Path(os.environ.get("UNAVAILABLE_FILE", "unavailable.json"))
+UNAVAILABLE_RANGES_FILE = Path(os.environ.get("UNAVAILABLE_RANGES_FILE", "unavailable_ranges.json"))
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -254,12 +255,42 @@ def get_date_overrides(target_date=None):
     return set(data.get(date_key, []))
 
 
+def get_range_overrides(target_date=None):
+    """Read range-based unavailability from unavailable_ranges.json.
+
+    Args:
+        target_date: datetime object for the date to check (defaults to today in LOCAL_TZ)
+
+    Returns: set of names marked unavailable via ranges for that date
+    """
+    if not UNAVAILABLE_RANGES_FILE.exists():
+        return set()
+    try:
+        data = json.loads(UNAVAILABLE_RANGES_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    if target_date is None:
+        target_date = datetime.now(LOCAL_TZ)
+    date_key = target_date.strftime("%Y-%m-%d")
+    result = set()
+    for entry in data:
+        start = entry.get("start", "")
+        end = entry.get("end", "")
+        person = entry.get("person", "")
+        if person and start <= date_key <= end:
+            result.add(person)
+    return result
+
+
 def get_day_exclusions(now=None):
     """Return people excluded based on day-specific env vars and date overrides.
 
     Merges:
       1. Day-of-week env vars (MONDAY_EXCLUSIONS, etc.) -- recurring, static
       2. Date-specific overrides from unavailable.json -- ad-hoc, from web UI
+      3. Range-based overrides from unavailable_ranges.json -- extended absences
 
     Returns: tuple of (set of original names for logging, set of lowercased names for matching)
     """
@@ -267,9 +298,10 @@ def get_day_exclusions(now=None):
     env_var = f"{day_name}_EXCLUSIONS"
     default = DEFAULT_DAY_EXCLUSIONS.get(day_name, "")
     excluded_names = parse_env_list(os.environ.get(env_var, default))
-    # Merge date-specific overrides
+    # Merge date-specific and range-based overrides
     date_overrides = get_date_overrides(now)
-    all_excluded = set(excluded_names) | date_overrides
+    range_overrides = get_range_overrides(now)
+    all_excluded = set(excluded_names) | date_overrides | range_overrides
     # Return both original (for logging) and normalized (for matching)
     return all_excluded, {name.casefold() for name in all_excluded}
 

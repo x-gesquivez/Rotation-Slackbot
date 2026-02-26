@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 UNAVAILABLE_FILE = Path(os.environ.get("UNAVAILABLE_FILE", "unavailable.json"))
+UNAVAILABLE_RANGES_FILE = Path(os.environ.get("UNAVAILABLE_RANGES_FILE", "unavailable_ranges.json"))
 PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 
 
@@ -47,6 +48,24 @@ def save_unavailable(data):
     today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
     pruned = {k: v for k, v in data.items() if k >= today and v}
     UNAVAILABLE_FILE.write_text(json.dumps(pruned, indent=2))
+
+
+def load_unavailable_ranges():
+    """Load range unavailability data from disk."""
+    if not UNAVAILABLE_RANGES_FILE.exists():
+        return []
+    try:
+        data = json.loads(UNAVAILABLE_RANGES_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_unavailable_ranges(data):
+    """Save range unavailability data, pruning expired ranges."""
+    today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    pruned = [r for r in data if r.get("end", "") >= today]
+    UNAVAILABLE_RANGES_FILE.write_text(json.dumps(pruned, indent=2))
 
 
 # ---- Routes ----
@@ -108,6 +127,53 @@ def delete_unavailable(date_str):
     data.pop(date_str, None)
     save_unavailable(data)
     return jsonify({"ok": True})
+
+
+@app.route("/api/unavailable-ranges", methods=["GET"])
+def get_unavailable_ranges():
+    return jsonify(load_unavailable_ranges())
+
+
+@app.route("/api/unavailable-ranges", methods=["POST"])
+def add_unavailable_range():
+    body = request.get_json()
+    person = body.get("person", "").strip()
+    start = body.get("start", "").strip()
+    end = body.get("end", "").strip()
+
+    valid_people = bot.get_config_list("PEOPLE", bot.PEOPLE)
+    if person not in valid_people:
+        return jsonify({"error": f"Unknown person: {person}"}), 400
+
+    for label, val in [("start", start), ("end", end)]:
+        if not val:
+            return jsonify({"error": f"{label} is required"}), 400
+        try:
+            datetime.strptime(val, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": f"Invalid {label} format, use YYYY-MM-DD"}), 400
+
+    if start > end:
+        return jsonify({"error": "start must be on or before end"}), 400
+
+    today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    if end < today:
+        return jsonify({"error": "Range is entirely in the past"}), 400
+
+    ranges = load_unavailable_ranges()
+    ranges.append({"person": person, "start": start, "end": end})
+    save_unavailable_ranges(ranges)
+    return jsonify({"ok": True, "range": {"person": person, "start": start, "end": end}})
+
+
+@app.route("/api/unavailable-ranges/<int:idx>", methods=["DELETE"])
+def delete_unavailable_range(idx):
+    ranges = load_unavailable_ranges()
+    if 0 <= idx < len(ranges):
+        ranges.pop(idx)
+        save_unavailable_ranges(ranges)
+        return jsonify({"ok": True})
+    return jsonify({"error": "Index out of range"}), 404
 
 
 @app.route("/health")

@@ -24,13 +24,16 @@ Automatically selects 2 people for **Service Desk** and assigns 2 **Operations**
 ### Unavailability Control Panel
 - **Web UI**: Simple control panel to mark people as unavailable for specific dates — no code changes needed
 - **Date picker**: Defaults to the next business day; select any future date
-- **Upcoming view**: Shows all future unavailability at a glance with clear buttons
-- **Automatic integration**: The bot reads date-based overrides at runtime alongside day-of-week exclusions
+- **Extended absence ranges**: Add date ranges for long absences (e.g., 2-month leave) — stored as compact range entries instead of individual days
+- **Upcoming view**: Shows all future single-date unavailability at a glance with clear buttons
+- **Date ranges view**: Displays active ranges as single-line entries (e.g., "Paul: Mar 1 – Apr 30") with remove buttons
+- **Automatic integration**: The bot merges day-of-week exclusions, single-date overrides, and date ranges at selection time
 - **Password protected**: Optional shared password via `PANEL_PASSWORD` env var to prevent unauthorized access
 
 ### Scheduling & Exclusions
 - **Day-specific exclusions**: Remove specific people from rotation on specific days via env vars (e.g., Alex unavailable Mondays)
 - **Date-specific exclusions**: Mark people as unavailable for specific dates via the web control panel
+- **Range-based exclusions**: Mark extended absences as date ranges — the bot checks if the target date falls within any active range
 - **Reduced operations days**: Configure days with 2+2 pattern (2 desk, 2 ops) instead of 2+all remaining
 - **Time guards**: Only executes at 9:00-9:09 AM Pacific (morning) or 5:25-5:39 PM Pacific (preview)
 
@@ -83,7 +86,7 @@ By default, Railway's filesystem is ephemeral — files like `selection_history.
 
 1. Railway dashboard → Service → **Volumes** → **Add Volume**
 2. Set mount path to `/app/data`
-3. Add env vars: `HISTORY_FILE=/app/data/selection_history.json` and `UNAVAILABLE_FILE=/app/data/unavailable.json`
+3. Add env vars: `HISTORY_FILE=/app/data/selection_history.json`, `UNAVAILABLE_FILE=/app/data/unavailable.json`, and `UNAVAILABLE_RANGES_FILE=/app/data/unavailable_ranges.json`
 
 ### 4. Test
 
@@ -116,6 +119,7 @@ Setting `SLACK_WEBHOOK_URL=""` logs the message instead of posting to Slack.
 | `FORCE_RESELECT` | Set to `1`, `true`, or `yes` to ignore the locked-in preview and re-randomize at 9:00 AM | Not set |
 | `HISTORY_FILE` | Path to selection history JSON file | `selection_history.json` |
 | `UNAVAILABLE_FILE` | Path to date-based unavailability JSON file (written by control panel) | `unavailable.json` |
+| `UNAVAILABLE_RANGES_FILE` | Path to range-based unavailability JSON file (written by control panel) | `unavailable_ranges.json` |
 | `LOG_LEVEL` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
 | `PANEL_PASSWORD` | Shared password for the control panel. If not set, no login required. | Not set |
 | `SECRET_KEY` | Flask session secret key. Auto-generated if not set (sessions reset on restart). | Auto-generated |
@@ -148,7 +152,7 @@ Setting `SLACK_WEBHOOK_URL=""` logs the message instead of posting to Slack.
 ### Selection Algorithm
 
 **Service Desk Selection:**
-1. **Exclude unavailable people**: Anyone excluded for the target day — via day-of-week env vars (e.g., `MONDAY_EXCLUSIONS`) or date-specific overrides from the control panel — is removed from the rotation entirely
+1. **Exclude unavailable people**: Anyone excluded for the target day — via day-of-week env vars (e.g., `MONDAY_EXCLUSIONS`), date-specific overrides, or date range entries from the control panel — is removed from the rotation entirely
 2. **Apply consecutive protection**: Anyone selected for Service Desk 2 days in a row becomes ineligible (soft exclusion — can be overridden if short-staffed)
 3. **Calculate weekly priority**:
    - People with 0 Service Desk assignments this week get 3x selection weight
@@ -213,10 +217,11 @@ APScheduler inside `server.py` replicates the bot's schedule (minutes 0/30 at ho
 
 ### Data Files
 
-Both are runtime artifacts (gitignored), created automatically:
+All are runtime artifacts (gitignored), created automatically:
 
 - **`selection_history.json`** — Bot state: last selections, weekly counts, locked-in previews
-- **`unavailable.json`** — Date-based unavailability entries from the control panel
+- **`unavailable.json`** — Single-date unavailability entries from the control panel
+- **`unavailable_ranges.json`** — Date range unavailability entries (e.g., `[{"person": "Paul", "start": "2026-03-01", "end": "2026-04-30"}]`)
 
 ## To Use Slack @mentions
 
