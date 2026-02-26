@@ -5,7 +5,8 @@ name = "slack-duty-bot"
 TZ = "America/Los_Angeles"
 
 [deploy]
-# Morning (9am Pacific): fires at 16:00 and 17:00 UTC Mon-Fri
-# Evening (5:30pm Pacific): fires at 00:30 and 01:30 UTC Tue-Sat (= Mon-Fri evenings)
-# Code guards (should_run_now / should_run_preview) filter to correct local times
-cronSchedule = "0,30 0,1,16,17 * * 1-6"
+startCommand = "python server.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 5
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

@@ -12,6 +12,7 @@ import requests
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 HISTORY_FILE = Path(os.environ.get("HISTORY_FILE", "selection_history.json"))
+UNAVAILABLE_FILE = Path(os.environ.get("UNAVAILABLE_FILE", "unavailable.json"))
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -233,20 +234,44 @@ def get_excluded_people(history):
     return set(history[0]) & set(history[1])
 
 
-def get_day_exclusions(now=None):
-    """Return people excluded based on day-specific env vars.
+def get_date_overrides(target_date=None):
+    """Read date-specific unavailability from unavailable.json.
 
-    Env vars: MONDAY_EXCLUSIONS, TUESDAY_EXCLUSIONS, etc.
-    Format: comma-separated names (e.g., "Alex,Ed")
-    Matching is case-insensitive.
+    Args:
+        target_date: datetime object for the date to check (defaults to today in LOCAL_TZ)
+
+    Returns: set of names marked unavailable for that date
+    """
+    if not UNAVAILABLE_FILE.exists():
+        return set()
+    try:
+        data = json.loads(UNAVAILABLE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return set()
+    if target_date is None:
+        target_date = datetime.now(LOCAL_TZ)
+    date_key = target_date.strftime("%Y-%m-%d")
+    return set(data.get(date_key, []))
+
+
+def get_day_exclusions(now=None):
+    """Return people excluded based on day-specific env vars and date overrides.
+
+    Merges:
+      1. Day-of-week env vars (MONDAY_EXCLUSIONS, etc.) -- recurring, static
+      2. Date-specific overrides from unavailable.json -- ad-hoc, from web UI
+
     Returns: tuple of (set of original names for logging, set of lowercased names for matching)
     """
     day_name = get_day_name(now).upper()  # e.g., "MONDAY"
     env_var = f"{day_name}_EXCLUSIONS"
     default = DEFAULT_DAY_EXCLUSIONS.get(day_name, "")
     excluded_names = parse_env_list(os.environ.get(env_var, default))
+    # Merge date-specific overrides
+    date_overrides = get_date_overrides(now)
+    all_excluded = set(excluded_names) | date_overrides
     # Return both original (for logging) and normalized (for matching)
-    return set(excluded_names), {name.casefold() for name in excluded_names}
+    return all_excluded, {name.casefold() for name in all_excluded}
 
 
 def get_people_needing_weekly_assignment(weekly, people):
